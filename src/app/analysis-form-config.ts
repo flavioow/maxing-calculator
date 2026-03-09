@@ -458,11 +458,17 @@ export function resolveModelId(ethnicity: string, sex: string): ModelId | null {
   return modelId in models ? modelId : null
 }
 
+export function normalizeSessionCode(value: string) {
+  return value.replace(/[^a-zA-Z0-9]/g, "").toUpperCase().slice(0, 6)
+}
+
 export const schema = z.object({
   subjectName: z.string().min(2, "Use pelo menos 2 caracteres."),
   sex: z.string().min(1, "Selecione um sexo."),
   ethnicity: z.string().min(1, "Selecione um modelo/etnia."),
-  sessionCode: z.string().max(6),
+  sessionCode: z
+    .string()
+    .regex(/^[A-Z0-9]{6}$/, "Use 6 caracteres (A-Z e 0-9) para o ID."),
   showHints: z.boolean(),
   compactGrid: z.boolean(),
   highBrows: z.boolean(),
@@ -496,6 +502,16 @@ export function humanizeKey(value: string) {
     .replaceAll(".", " ")
     .replaceAll("_", " ")
     .replace(/\b\w/g, (match) => match.toUpperCase())
+}
+
+const MODEL_OPTION_LABELS: Record<string, string> = {
+  male: "Masculino",
+  female: "Feminino",
+  caucasian: "Caucasiano",
+}
+
+export function formatModelOptionLabel(value: string) {
+  return MODEL_OPTION_LABELS[value] ?? humanizeKey(value)
 }
 
 export function formatMetricLabel(metricId: string) {

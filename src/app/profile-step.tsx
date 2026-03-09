@@ -2,8 +2,9 @@ import type { FieldErrors, UseFormRegister, UseFormSetValue } from "react-hook-f
 import {
   AVAILABLE_MODEL_IDS,
   AVAILABLE_SEXES,
+  formatModelOptionLabel,
   type FormData,
-  humanizeKey,
+  normalizeSessionCode,
 } from "./analysis-form-config"
 import {
   Field,
@@ -101,7 +102,7 @@ export function ProfileStep({
                     <SelectItem
                       key={ethnicityOption}
                       value={ethnicityOption}>
-                      {humanizeKey(ethnicityOption)}
+                      {formatModelOptionLabel(ethnicityOption)}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -138,7 +139,7 @@ export function ProfileStep({
                         id={optionId}
                         value={sexOption}
                       />
-                      <span>{humanizeKey(sexOption)}</span>
+                      <span>{formatModelOptionLabel(sexOption)}</span>
                     </Field>
                   </FieldLabel>
                 )
@@ -193,7 +194,9 @@ export function ProfileStep({
                 maxLength={6}
                 value={sessionCode}
                 onChange={(value) =>
-                  setValue("sessionCode", value, { shouldDirty: true })
+                  setValue("sessionCode", normalizeSessionCode(value), {
+                    shouldDirty: true,
+                  })
                 }>
                 <InputOTPGroup>
                   <InputOTPSlot index={0} />
@@ -208,8 +211,10 @@ export function ProfileStep({
                 </InputOTPGroup>
               </InputOTP>
               <FieldDescription>
-                Opcional. Bom para vincular análise a lote/foto.
+                ID local da análise. Mesmo ID sobrescreve, ID novo cria outra
+                pessoa.
               </FieldDescription>
+              <FieldError>{errors.sessionCode?.message}</FieldError>
             </Field>
           </FieldGroup>
         </FieldSet>

@@ -3,6 +3,7 @@
 import { zodResolver } from "@hookform/resolvers/zod"
 import { useEffect, useMemo, useState } from "react"
 import { useForm } from "react-hook-form"
+import { z } from "zod"
 import type { RawMeasurementId } from "@/analysis/features/raw-measurements"
 import { models } from "@/analysis/models"
 import { analyzeFace } from "@/analysis/pipeline/analyze-face"
@@ -16,6 +17,7 @@ import {
   type FormData,
   humanizeKey,
   MODEL_VARIANTS,
+  normalizeSessionCode,
   RAW_FIELDS,
   RAW_STEPS,
   type RawField,
@@ -26,22 +28,193 @@ import {
   STEP_META,
   STEP_ORDER,
 } from "./analysis-form-config"
+import { AnalysisComparisonDialog } from "./analysis-comparison-dialog"
+import {
+  type AnalysisDashboardData,
+  type RankedMetric,
+} from "./analysis-result-dashboard"
 import { ProfileStep } from "./profile-step"
 import { QualitativeStep } from "./qualitative-step"
 import { RawStepSection } from "./raw-step"
 import { ResultsStep } from "./results-step"
+import {
+  SavedAnalysesPanel,
+  type SavedAnalysisRecord,
+} from "./saved-analyses-panel"
+
+const LOCAL_ANALYSES_STORAGE_KEY = "maxing-calculator:analyses:v1"
+
+const storedAnalysisRecordSchema = z.object({
+  sessionCode: z.string(),
+  subjectName: z.string(),
+  sex: z.string(),
+  ethnicity: z.string(),
+  finalScore: z.number(),
+  scoredMetricsCount: z.number().int().nonnegative(),
+  totalModelMetrics: z.number().int().nonnegative(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  formData: schema,
+})
+
+type StoredAnalysisRecord = z.infer<typeof storedAnalysisRecordSchema>
+type AnalysisData = ReturnType<typeof analyzeFace>
+type ComparisonParticipant = {
+  record: SavedAnalysisRecord
+  dashboard: AnalysisDashboardData
+}
+
+function buildRawMeasurements(values: FormData) {
+  const raw: Partial<Record<RawMeasurementId, number>> = {}
+
+  for (const field of RAW_FIELDS) {
+    raw[field.id] = values.raw[field.key]
+  }
+
+  return raw
+}
+
+function buildExtraMetrics(values: FormData): MeasurementInput {
+  return {
+    "brows.height": values.highBrows,
+    "eyes.orbital_vector": values.orbitalVector,
+    "skin.quality": values.skinQuality,
+    "symmetry.overall": values.overallSymmetry,
+    "fat.level": values.fatLevel,
+    "expression.neutrality": values.expressionTone,
+  }
+}
+
+function computeCoverageStats(analysis: AnalysisData) {
+  const totalModelMetrics = analysis.model.pillars.reduce((pillarAcc, pillar) => {
+    const totalInPillar = pillar.groups.reduce(
+      (groupAcc, group) => groupAcc + group.metrics.length,
+      0,
+    )
+    return pillarAcc + totalInPillar
+  }, 0)
+
+  const scoredMetricsCount = analysis.model.pillars.reduce((pillarAcc, pillar) => {
+    const coveredInPillar = pillar.groups.reduce((groupAcc, group) => {
+      const coveredInGroup = group.metrics.filter(
+        (metric) => analysis.metrics[metric.id] !== undefined,
+      ).length
+      return groupAcc + coveredInGroup
+    }, 0)
+
+    return pillarAcc + coveredInPillar
+  }, 0)
+
+  return {
+    scoredMetricsCount,
+    totalModelMetrics,
+  }
+}
+
+function buildDashboardData(
+  analysis: AnalysisData,
+  sessionCode: string,
+): AnalysisDashboardData {
+  const coverage = computeCoverageStats(analysis)
+
+  const pillarScoreData = analysis.model.pillars.map((pillar) => ({
+    pillar: humanizeKey(pillar.id),
+    score: Number((analysis.result.pillarScores[pillar.id] ?? 0).toFixed(2)),
+    max: 10,
+  }))
+
+  const orderedGroups = analysis.model.pillars.flatMap((pillar) =>
+    pillar.groups.map((group) => group.id),
+  )
+
+  const groupScoreData = orderedGroups.map((groupId) => ({
+    group: humanizeKey(groupId),
+    score: Number((analysis.result.groupScores[groupId] ?? 0).toFixed(2)),
+  }))
+
+  const achieved = Number(analysis.result.finalScore.toFixed(2))
+  const remaining = Number(Math.max(0, 10 - achieved).toFixed(2))
+
+  const radialData = [
+    {
+      label: "final",
+      achieved,
+      remaining,
+    },
+  ]
+
+  const metricRanking: RankedMetric[] = Object.entries(analysis.result.metricScores)
+    .map(([metricId, score]) => ({
+      metricId,
+      label: formatMetricLabel(metricId),
+      score: Number(score.toFixed(2)),
+    }))
+    .sort((a, b) => b.score - a.score)
+
+  return {
+    analysisResult: analysis,
+    scoredMetricsCount: coverage.scoredMetricsCount,
+    totalModelMetrics: coverage.totalModelMetrics,
+    sessionCode,
+    pillarScoreData,
+    radialData,
+    groupScoreData,
+    strengths: metricRanking.slice(0, 5),
+    weaknesses: [...metricRanking].reverse().slice(0, 5),
+  }
+}
+
+function getTimestamp(value: string) {
+  const date = new Date(value)
+
+  if (Number.isNaN(date.getTime())) {
+    return 0
+  }
+
+  return date.getTime()
+}
+
+function readStoredAnalyses() {
+  if (typeof window === "undefined") return [] as StoredAnalysisRecord[]
+
+  try {
+    const raw = window.localStorage.getItem(LOCAL_ANALYSES_STORAGE_KEY)
+
+    if (!raw) return []
+
+    const parsed = JSON.parse(raw)
+
+    if (!Array.isArray(parsed)) return []
+
+    return parsed
+      .map((record) => storedAnalysisRecordSchema.safeParse(record))
+      .filter((result) => result.success)
+      .map((result) => result.data)
+      .sort((a, b) => getTimestamp(b.updatedAt) - getTimestamp(a.updatedAt))
+  } catch {
+    return []
+  }
+}
+
+function writeStoredAnalyses(records: StoredAnalysisRecord[]) {
+  if (typeof window === "undefined") return
+
+  window.localStorage.setItem(LOCAL_ANALYSES_STORAGE_KEY, JSON.stringify(records))
+}
 
 export function AnalysisWorkspace() {
   const [activeStep, setActiveStep] = useState<StepId>("profile")
   const [analysisError, setAnalysisError] = useState<string | null>(null)
-  const [analysisResult, setAnalysisResult] = useState<ReturnType<
-    typeof analyzeFace
-  > | null>(null)
+  const [analysisResult, setAnalysisResult] = useState<AnalysisData | null>(null)
+  const [savedAnalyses, setSavedAnalyses] = useState<StoredAnalysisRecord[]>([])
+  const [compareSelection, setCompareSelection] = useState<string[]>([])
+  const [compareDialogOpen, setCompareDialogOpen] = useState(false)
 
   const {
     register,
     setValue,
     watch,
+    reset,
     formState: { errors, isSubmitting },
     handleSubmit,
   } = useForm<FormData>({
@@ -77,6 +250,10 @@ export function AnalysisWorkspace() {
   const expressionTone = watch("expressionTone")
   const rawValues = watch("raw")
 
+  useEffect(() => {
+    setSavedAnalyses(readStoredAnalyses())
+  }, [])
+
   const availableEthnicitiesForSex = useMemo(() => {
     const options = MODEL_VARIANTS.filter((variant) => variant.sex === sex).map(
       (variant) => variant.ethnicity,
@@ -98,7 +275,6 @@ export function AnalysisWorkspace() {
   const selectedModelId = resolveModelId(ethnicity, sex)
   const selectedModel = selectedModelId ? models[selectedModelId] : null
   const modelAvailable = selectedModel !== null
-  const analysisModel = analysisResult?.model ?? selectedModel
 
   const rawErrors =
     (errors.raw as Record<string, { message?: string } | undefined>) ?? {}
@@ -119,85 +295,66 @@ export function AnalysisWorkspace() {
     return grouped
   }, [])
 
-  const totalModelMetrics = useMemo(() => {
-    if (!analysisModel) return 0
+  const currentDashboardData = useMemo(() => {
+    if (!analysisResult) return null
 
-    return analysisModel.pillars.reduce((acc, pillar) => {
-      const groupMetrics = pillar.groups.reduce(
-        (groupAcc, group) => groupAcc + group.metrics.length,
-        0,
+    return buildDashboardData(analysisResult, normalizeSessionCode(sessionCode))
+  }, [analysisResult, sessionCode])
+
+  const savedAnalysisRows = useMemo<SavedAnalysisRecord[]>(
+    () => savedAnalyses.map(({ formData, ...record }) => record),
+    [savedAnalyses],
+  )
+
+  const comparisonParticipants = useMemo(() => {
+    if (compareSelection.length !== 2) {
+      return null
+    }
+
+    const participants: ComparisonParticipant[] = []
+
+    for (const sessionId of compareSelection) {
+      const savedRecord = savedAnalyses.find(
+        (record) => record.sessionCode === sessionId,
       )
-      return acc + groupMetrics
-    }, 0)
-  }, [analysisModel])
 
-  const pillarScoreData = useMemo(() => {
-    if (!analysisResult) return []
+      if (!savedRecord) {
+        return null
+      }
 
-    return analysisResult.model.pillars.map((pillar) => ({
-      pillar: humanizeKey(pillar.id),
-      score: Number((analysisResult.result.pillarScores[pillar.id] ?? 0).toFixed(2)),
-      max: 10,
-    }))
-  }, [analysisResult])
+      const modelId = resolveModelId(savedRecord.formData.ethnicity, savedRecord.formData.sex)
 
-  const groupScoreData = useMemo(() => {
-    if (!analysisResult) return []
+      if (!modelId) {
+        return null
+      }
 
-    const orderedGroups = analysisResult.model.pillars.flatMap((pillar) =>
-      pillar.groups.map((group) => group.id),
-    )
+      const analysis = analyzeFace(
+        buildRawMeasurements(savedRecord.formData),
+        buildExtraMetrics(savedRecord.formData),
+        modelId,
+      )
 
-    return orderedGroups.map((groupId) => ({
-      group: humanizeKey(groupId),
-      score: Number((analysisResult.result.groupScores[groupId] ?? 0).toFixed(2)),
-    }))
-  }, [analysisResult])
+      const { formData, ...row } = savedRecord
 
-  const radialData = useMemo(() => {
-    if (!analysisResult) return []
+      participants.push({
+        record: row,
+        dashboard: buildDashboardData(analysis, savedRecord.sessionCode),
+      })
+    }
 
-    const achieved = Number(analysisResult.result.finalScore.toFixed(2))
-    const remaining = Number(Math.max(0, 10 - achieved).toFixed(2))
+    return {
+      left: participants[0],
+      right: participants[1],
+    }
+  }, [compareSelection, savedAnalyses])
 
-    return [
-      {
-        label: "final",
-        achieved,
-        remaining,
-      },
-    ]
-  }, [analysisResult])
+  useEffect(() => {
+    if (!compareDialogOpen) return
 
-  const metricRanking = useMemo(() => {
-    if (!analysisResult) return []
-
-    return Object.entries(analysisResult.result.metricScores)
-      .map(([metricId, score]) => ({
-        metricId,
-        label: formatMetricLabel(metricId),
-        score: Number(score.toFixed(2)),
-      }))
-      .sort((a, b) => b.score - a.score)
-  }, [analysisResult])
-
-  const strengths = metricRanking.slice(0, 5)
-  const weaknesses = [...metricRanking].reverse().slice(0, 5)
-
-  const scoredMetricsCount = useMemo(() => {
-    if (!analysisResult) return 0
-
-    return analysisResult.model.pillars.reduce((pillarAcc, pillar) => {
-      const coveredInPillar = pillar.groups.reduce((groupAcc, group) => {
-        const coveredInGroup = group.metrics.filter(
-          (metric) => analysisResult.metrics[metric.id] !== undefined,
-        ).length
-        return groupAcc + coveredInGroup
-      }, 0)
-
-      return pillarAcc + coveredInPillar
-    }, 0)
-  }, [analysisResult])
+    if (compareSelection.length !== 2 || !comparisonParticipants) {
+      setCompareDialogOpen(false)
+    }
+  }, [compareDialogOpen, compareSelection, comparisonParticipants])
 
   function goNextStep() {
     if (currentStepIndex < STEP_ORDER.length - 1) {
@@ -223,36 +380,158 @@ export function AnalysisWorkspace() {
     }).length
   }
 
+  function persistAnalysisLocally(values: FormData, analysis: AnalysisData) {
+    const now = new Date().toISOString()
+    const coverage = computeCoverageStats(analysis)
+
+    setSavedAnalyses((previous) => {
+      const existing = previous.find(
+        (record) => record.sessionCode === values.sessionCode,
+      )
+
+      const nextRecord: StoredAnalysisRecord = {
+        sessionCode: values.sessionCode,
+        subjectName: values.subjectName,
+        sex: values.sex,
+        ethnicity: values.ethnicity,
+        finalScore: Number(analysis.result.finalScore.toFixed(2)),
+        scoredMetricsCount: coverage.scoredMetricsCount,
+        totalModelMetrics: coverage.totalModelMetrics,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+        formData: values,
+      }
+
+      const nextRecords = [
+        nextRecord,
+        ...previous.filter((record) => record.sessionCode !== values.sessionCode),
+      ]
+
+      writeStoredAnalyses(nextRecords)
+      return nextRecords
+    })
+  }
+
   function onSubmit(values: FormData) {
-    const selectedModelId = resolveModelId(values.ethnicity, values.sex)
+    const normalizedSessionCode = normalizeSessionCode(values.sessionCode)
+    const normalizedSubjectName = values.subjectName.trim()
+
+    const normalizedValues: FormData = {
+      ...values,
+      subjectName: normalizedSubjectName,
+      sessionCode: normalizedSessionCode,
+    }
+
+    if (values.sessionCode !== normalizedSessionCode) {
+      setValue("sessionCode", normalizedSessionCode, {
+        shouldDirty: true,
+      })
+    }
+
+    if (values.subjectName !== normalizedSubjectName) {
+      setValue("subjectName", normalizedSubjectName, {
+        shouldDirty: true,
+      })
+    }
+
+    const selectedModelId = resolveModelId(normalizedValues.ethnicity, normalizedValues.sex)
 
     if (!selectedModelId) {
       setAnalysisResult(null)
-      setAnalysisError(`Modelo ${values.ethnicity}_${values.sex} não encontrado.`)
+      setAnalysisError(
+        `Modelo ${normalizedValues.ethnicity}_${normalizedValues.sex} não encontrado.`,
+      )
       setActiveStep("results")
       return
     }
 
-    const raw: Partial<Record<RawMeasurementId, number>> = {}
-
-    for (const field of RAW_FIELDS) {
-      raw[field.id] = values.raw[field.key]
-    }
-
-    const extraMetrics: MeasurementInput = {
-      "brows.height": values.highBrows,
-      "eyes.orbital_vector": values.orbitalVector,
-      "skin.quality": values.skinQuality,
-      "symmetry.overall": values.overallSymmetry,
-      "fat.level": values.fatLevel,
-      "expression.neutrality": values.expressionTone,
-    }
-
+    const raw = buildRawMeasurements(normalizedValues)
+    const extraMetrics = buildExtraMetrics(normalizedValues)
     const analysis = analyzeFace(raw, extraMetrics, selectedModelId)
 
     setAnalysisError(null)
     setAnalysisResult(analysis)
     setActiveStep("results")
+    persistAnalysisLocally(normalizedValues, analysis)
+  }
+
+  function handleLoadRecord(sessionCode: string) {
+    const savedRecord = savedAnalyses.find(
+      (record) => record.sessionCode === sessionCode,
+    )
+
+    if (!savedRecord) return
+
+    reset(savedRecord.formData)
+    setActiveStep("profile")
+
+    const selectedModelId = resolveModelId(
+      savedRecord.formData.ethnicity,
+      savedRecord.formData.sex,
+    )
+
+    if (!selectedModelId) {
+      setAnalysisResult(null)
+      setAnalysisError(
+        `Modelo ${savedRecord.formData.ethnicity}_${savedRecord.formData.sex} não encontrado para o registro ${savedRecord.sessionCode}.`,
+      )
+      return
+    }
+
+    const analysis = analyzeFace(
+      buildRawMeasurements(savedRecord.formData),
+      buildExtraMetrics(savedRecord.formData),
+      selectedModelId,
+    )
+
+    setAnalysisError(null)
+    setAnalysisResult(analysis)
+  }
+
+  function handleDeleteRecord(sessionCode: string) {
+    setSavedAnalyses((previous) => {
+      const nextRecords = previous.filter(
+        (record) => record.sessionCode !== sessionCode,
+      )
+
+      writeStoredAnalyses(nextRecords)
+      return nextRecords
+    })
+
+    setCompareSelection((previous) =>
+      previous.filter((recordId) => recordId !== sessionCode),
+    )
+  }
+
+  function handleToggleCompareSelection(sessionCode: string) {
+    setCompareSelection((previous) => {
+      if (previous.includes(sessionCode)) {
+        return previous.filter((recordId) => recordId !== sessionCode)
+      }
+
+      if (previous.length >= 2) {
+        return [previous[1], sessionCode]
+      }
+
+      return [...previous, sessionCode]
+    })
+  }
+
+  function handleClearCompareSelection() {
+    setCompareSelection([])
+  }
+
+  function handleOpenComparison() {
+    if (compareSelection.length !== 2) {
+      return
+    }
+
+    if (!comparisonParticipants) {
+      setAnalysisError("Não foi possível montar a comparação com os registros selecionados.")
+      return
+    }
+
+    setCompareDialogOpen(true)
   }
 
   return (
@@ -340,14 +619,14 @@ export function AnalysisWorkspace() {
                 isSubmitting={isSubmitting}
                 analysisError={analysisError}
                 analysisResult={analysisResult}
-                scoredMetricsCount={scoredMetricsCount}
-                totalModelMetrics={totalModelMetrics}
-                sessionCode={sessionCode}
-                pillarScoreData={pillarScoreData}
-                radialData={radialData}
-                groupScoreData={groupScoreData}
-                strengths={strengths}
-                weaknesses={weaknesses}
+                scoredMetricsCount={currentDashboardData?.scoredMetricsCount ?? 0}
+                totalModelMetrics={currentDashboardData?.totalModelMetrics ?? 0}
+                sessionCode={currentDashboardData?.sessionCode ?? sessionCode}
+                pillarScoreData={currentDashboardData?.pillarScoreData ?? []}
+                radialData={currentDashboardData?.radialData ?? []}
+                groupScoreData={currentDashboardData?.groupScoreData ?? []}
+                strengths={currentDashboardData?.strengths ?? []}
+                weaknesses={currentDashboardData?.weaknesses ?? []}
               />
             </TabsContent>
           </Tabs>
@@ -386,7 +665,26 @@ export function AnalysisWorkspace() {
             )}
           </div>
         </form>
+
+        <SavedAnalysesPanel
+          records={savedAnalysisRows}
+          currentSessionCode={normalizeSessionCode(sessionCode)}
+          selectedSessionCodes={compareSelection}
+          canCompareSelected={compareSelection.length === 2}
+          onToggleCompareSelection={handleToggleCompareSelection}
+          onClearCompareSelection={handleClearCompareSelection}
+          onCompareSelected={handleOpenComparison}
+          onLoadRecord={handleLoadRecord}
+          onDeleteRecord={handleDeleteRecord}
+        />
       </div>
+
+      <AnalysisComparisonDialog
+        open={compareDialogOpen}
+        onOpenChange={setCompareDialogOpen}
+        left={comparisonParticipants?.left ?? null}
+        right={comparisonParticipants?.right ?? null}
+      />
     </main>
   )
 }
