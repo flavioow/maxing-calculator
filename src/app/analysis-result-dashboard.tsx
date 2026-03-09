@@ -88,7 +88,7 @@ export function AnalysisResultDashboard({ data }: AnalysisResultDashboardProps) 
           <p className="mb-3 text-sm font-medium">Gráfico de Radar: pilares</p>
           <ChartContainer
             config={pillarChartConfig}
-            className="h-[280px] w-full">
+            className="h-70 w-full">
             <RadarChart data={data.pillarScoreData}>
               <ChartTooltip content={<ChartTooltipContent />} />
               <PolarGrid />
@@ -187,7 +187,7 @@ export function AnalysisResultDashboard({ data }: AnalysisResultDashboardProps) 
         </p>
         <ChartContainer
           config={groupChartConfig}
-          className="h-[300px] w-full">
+          className="h-75 w-full">
           <AreaChart
             data={data.groupScoreData}
             margin={{ left: 6, right: 12 }}>
