@@ -381,9 +381,9 @@ export const caucasianMaleModel: Model = {
               id: "expression.neutrality",
               type: "categorical",
               scores: {
-                tense: 3,
-                neutral: 6,
-                positive: 10,
+                strong_lines: 3,
+                mild_lines: 7,
+                no_lines: 10,
               },
               weight: 1,
             },
